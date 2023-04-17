@@ -17,3 +17,10 @@ build_uniqueid:
 
 run_uniqueid:
 	./third-party/maelstrom/maelstrom test -w unique-ids --bin ./bin/maelstrom-unique-id --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
+
+build_broadcast:
+	go build -o ./bin/maelstrom-broadcast ./cmd/broadcast/main.go
+	chmod +x ./bin/maelstrom-broadcast
+
+run_broadcast_singlenode:
+	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 1 --time-limit 20 --rate 10
