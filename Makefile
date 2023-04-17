@@ -10,3 +10,10 @@ build_echo:
 
 run_echo:
 	./third-party/maelstrom/maelstrom test -w echo --bin ./bin/maelstrom-echo --node-count 1 --time-limit 10
+
+build_uniqueid:
+	go build -o ./bin/maelstrom-unique-id ./cmd/unique-id/main.go
+	chmod +x ./bin/maelstrom-unique-id
+
+run_uniqueid:
+	./third-party/maelstrom/maelstrom test -w unique-ids --bin ./bin/maelstrom-unique-id --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
