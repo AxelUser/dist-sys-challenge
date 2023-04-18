@@ -9,61 +9,78 @@ import (
 )
 
 type broadcastSvc struct {
-	seen  map[int]struct{}
-	m     []int
-	t     map[string]int
-	mLock sync.RWMutex
-	tLock sync.RWMutex
+	seen    map[int]struct{}
+	m       []int
+	pending map[string]map[int]struct{}
+	msgLock sync.RWMutex
+	brLock  sync.RWMutex
 }
 
 func createBroadcastSvc() *broadcastSvc {
 	return &broadcastSvc{
-		seen: make(map[int]struct{}),
-		t:    make(map[string]int),
-		m:    make([]int, 0),
+		pending: make(map[string]map[int]struct{}),
+		seen:    make(map[int]struct{}),
+		m:       make([]int, 0),
 	}
 }
 
 func (svc *broadcastSvc) add(v int) bool {
-	svc.mLock.Lock()
+	svc.msgLock.Lock()
 	var seen bool
 	if _, seen = svc.seen[v]; !seen {
 		svc.seen[v] = struct{}{}
 		svc.m = append(svc.m, v)
 	}
-	svc.mLock.Unlock()
+	svc.msgLock.Unlock()
 	return !seen
 }
 
 func (svc *broadcastSvc) values() []int {
-	svc.mLock.RLock()
+	svc.msgLock.RLock()
 	cp := make([]int, len(svc.m))
 	copy(cp, svc.m)
-	svc.mLock.RUnlock()
+	svc.msgLock.RUnlock()
 	return cp
 }
 
 func (svc *broadcastSvc) updateTopology(nodes []string) {
-	svc.tLock.Lock()
+	svc.brLock.Lock()
 	for _, n := range nodes {
-		if _, ok := svc.t[n]; !ok {
-			svc.t[n] = 0
+		if _, ok := svc.pending[n]; !ok {
+			svc.pending[n] = make(map[int]struct{})
 		}
 	}
-	svc.tLock.Unlock()
+	svc.brLock.Unlock()
 }
 
 func (svc *broadcastSvc) unsent() map[string][]int {
-	svc.tLock.Lock()
-	seen := svc.values()
-	len := len(seen)
 	unsent := make(map[string][]int)
-	for node, sent := range svc.t {
-		unsent[node] = seen[sent:]
-		svc.t[node] = len
+	svc.brLock.Lock()
+	for node, nPending := range svc.pending {
+		ls := make([]int, len(nPending))
+		for k, _ := range nPending {
+			ls = append(ls, k)
+		}
+		unsent[node] = ls
 	}
-	svc.tLock.Unlock()
+	svc.brLock.Unlock()
 	return unsent
+}
+
+func (svc *broadcastSvc) startSend(msg int) {
+	svc.brLock.Lock()
+	for node, _ := range svc.pending {
+		svc.pending[node][msg] = struct{}{}
+	}
+	svc.brLock.Unlock()
+}
+
+func (svc *broadcastSvc) commitSent(node string, msg int) {
+	svc.brLock.Lock()
+	if nPending, ok := svc.pending[node]; ok {
+		delete(nPending, msg)
+	}
+	svc.brLock.Unlock()
 }
 
 func main() {
@@ -82,16 +99,19 @@ func main() {
 		}
 
 		if svc.add(body.Message) {
+			svc.startSend(body.Message)
 			unsent := svc.unsent()
-			for node, values := range unsent {
-				if node == msg.Src {
-					continue
-				}
-				for _, v := range values {
-					n.RPC(node, broadcastBody{
-						Type:    "broadcast",
-						Message: v,
-					}, func(msg maelstrom.Message) error { return nil })
+			for node, nodeMessages := range unsent {
+				for message := range nodeMessages {
+					func(nd string, m int) {
+						n.RPC(nd, broadcastBody{
+							Type:    "broadcast",
+							Message: message,
+						}, func(msg maelstrom.Message) error {
+							svc.commitSent(node, m)
+							return nil
+						})
+					}(node, message)
 				}
 			}
 		}

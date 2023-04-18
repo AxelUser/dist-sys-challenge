@@ -27,3 +27,6 @@ run_broadcast_singlenode:
 
 run_broadcast_multinode:
 	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 5 --time-limit 20 --rate 10
+
+run_broadcast_partition:
+	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 5 --time-limit 20 --rate 10 --nemesis partition
