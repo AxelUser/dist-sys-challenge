@@ -2,18 +2,12 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
-
-type workItem struct {
-	mid string
-	dst string
-	msg broadcastBody
-}
 
 type broadcastBody struct {
 	Type    string `json:"type"`
@@ -63,52 +57,62 @@ func (svc *broadcastSvc) neighbors() []string {
 	return svc.nbrs
 }
 
-func workers(n *maelstrom.Node, count int, work chan workItem) {
-	acks := make(map[string]struct{})
-	var ackLock sync.RWMutex
+func send(n *maelstrom.Node, receivers map[string]bool, body broadcastBody, delay time.Duration) {
+	exit := make(chan bool, 1)
 
-	log.Printf("Starting %d senders", count)
+	count := len(receivers)
+	log.Printf("Broadcasting %d to %d receivers", body.Message, count)
+	var wg sync.WaitGroup
+	wg.Add(count)
 
-	for i := 0; i < count; i++ {
-		senderId := i
-		go func() {
-			for {
-				item, open := <-work
-				if !open {
-					return
-				}
+	go func() {
+		wg.Wait()
+		exit <- true
+	}()
 
-				ackLock.RLock()
-				_, acked := acks[item.mid]
-				ackLock.RUnlock()
-
-				if acked {
-					ackLock.Lock()
-					delete(acks, item.mid)
-					ackLock.Unlock()
-					continue
-				}
-
-				log.Printf("Sender %d: sending %d to node %s", senderId, item.msg.Message, item.dst)
-				n.RPC(item.dst, item.msg, func(msg maelstrom.Message) error {
-					log.Printf("Sender %d: acknowledged %d from node %s", senderId, item.msg.Message, item.dst)
-					ackLock.Lock()
-					acks[item.mid] = struct{}{}
-					ackLock.Unlock()
-					return nil
-				})
-				work <- item
+	var sendLock sync.RWMutex
+	broadcast := func() {
+		for dst := range receivers {
+			sendLock.RLock()
+			received := receivers[dst]
+			sendLock.RUnlock()
+			if received {
+				continue
 			}
-		}()
+
+			log.Printf("Sending %d to node %s", body.Message, dst)
+			n.RPC(dst, body, func(msg maelstrom.Message) error {
+				log.Printf("Acknowledged %d from node %s", body.Message, msg.Src)
+				sendLock.Lock()
+				receivers[msg.Src] = true
+				sendLock.Unlock()
+				wg.Done()
+				return nil
+			})
+		}
 	}
+
+	go func() {
+		broadcast()
+		for {
+			select {
+			case <-exit:
+				log.Printf("Broadcasting %d completed", body.Message)
+				return
+			case <-time.After(delay): // retry after delay
+				log.Printf("Retry broadcasting %d after %v", body.Message, delay)
+				broadcast()
+			}
+		}
+	}()
+
 }
+
+const RETRY_MILL = 2000
 
 func main() {
 	n := maelstrom.NewNode()
 	svc := createBroadcastSvc()
-
-	work := make(chan workItem, 100_000)
-	workers(n, 1, work)
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body broadcastBody
@@ -121,22 +125,15 @@ func main() {
 
 			neighbors := svc.neighbors()
 
-			for _, dst := range neighbors {
-				if dst == msg.Src {
+			receivers := make(map[string]bool)
+			for _, nbr := range neighbors {
+				if nbr == msg.Src {
 					continue
 				}
-
-				log.Printf("Scheduling message %d to %s", body.Message, dst)
-				select {
-				case work <- workItem{
-					mid: fmt.Sprintf("%s-%d", dst, body.Message),
-					dst: dst,
-					msg: body,
-				}:
-				default:
-					fmt.Println("Channel full. Discarding message")
-				}
+				receivers[nbr] = false
 			}
+
+			send(n, receivers, body, time.Duration(time.Millisecond*RETRY_MILL))
 		}
 
 		res := make(map[string]any)
@@ -173,5 +170,4 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
-	close(work)
 }
