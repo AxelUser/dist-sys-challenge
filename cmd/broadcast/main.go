@@ -2,25 +2,36 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type workItem struct {
+	mid string
+	dst string
+	msg broadcastBody
+}
+
+type broadcastBody struct {
+	Type    string `json:"type"`
+	Message int    `json:"message"`
+}
+
 type broadcastSvc struct {
 	seen    map[int]struct{}
-	m       []int
 	pending map[string]map[int]struct{}
+	nbrs    []string
 	msgLock sync.RWMutex
-	brLock  sync.RWMutex
 }
 
 func createBroadcastSvc() *broadcastSvc {
 	return &broadcastSvc{
 		pending: make(map[string]map[int]struct{}),
 		seen:    make(map[int]struct{}),
-		m:       make([]int, 0),
+		nbrs:    make([]string, 0),
 	}
 }
 
@@ -29,7 +40,6 @@ func (svc *broadcastSvc) add(v int) bool {
 	var seen bool
 	if _, seen = svc.seen[v]; !seen {
 		svc.seen[v] = struct{}{}
-		svc.m = append(svc.m, v)
 	}
 	svc.msgLock.Unlock()
 	return !seen
@@ -37,60 +47,68 @@ func (svc *broadcastSvc) add(v int) bool {
 
 func (svc *broadcastSvc) values() []int {
 	svc.msgLock.RLock()
-	cp := make([]int, len(svc.m))
-	copy(cp, svc.m)
+	cp := make([]int, 0)
+	for v := range svc.seen {
+		cp = append(cp, v)
+	}
 	svc.msgLock.RUnlock()
 	return cp
 }
 
-func (svc *broadcastSvc) updateTopology(nodes []string) {
-	svc.brLock.Lock()
-	for _, n := range nodes {
-		if _, ok := svc.pending[n]; !ok {
-			svc.pending[n] = make(map[int]struct{})
-		}
-	}
-	svc.brLock.Unlock()
+func (svc *broadcastSvc) setNeighbors(nodes []string) {
+	svc.nbrs = nodes
 }
 
-func (svc *broadcastSvc) unsent() map[string][]int {
-	unsent := make(map[string][]int)
-	svc.brLock.Lock()
-	for node, nPending := range svc.pending {
-		ls := make([]int, len(nPending))
-		for k, _ := range nPending {
-			ls = append(ls, k)
-		}
-		unsent[node] = ls
-	}
-	svc.brLock.Unlock()
-	return unsent
+func (svc *broadcastSvc) neighbors() []string {
+	return svc.nbrs
 }
 
-func (svc *broadcastSvc) startSend(msg int) {
-	svc.brLock.Lock()
-	for node, _ := range svc.pending {
-		svc.pending[node][msg] = struct{}{}
-	}
-	svc.brLock.Unlock()
-}
+func workers(n *maelstrom.Node, count int, work chan workItem) {
+	acks := make(map[string]struct{})
+	var ackLock sync.RWMutex
 
-func (svc *broadcastSvc) commitSent(node string, msg int) {
-	svc.brLock.Lock()
-	if nPending, ok := svc.pending[node]; ok {
-		delete(nPending, msg)
+	log.Printf("Starting %d senders", count)
+
+	for i := 0; i < count; i++ {
+		senderId := i
+		go func() {
+			for {
+				item, open := <-work
+				if !open {
+					return
+				}
+
+				ackLock.RLock()
+				_, acked := acks[item.mid]
+				ackLock.RUnlock()
+
+				if acked {
+					ackLock.Lock()
+					delete(acks, item.mid)
+					ackLock.Unlock()
+					continue
+				}
+
+				log.Printf("Sender %d: sending %d to node %s", senderId, item.msg.Message, item.dst)
+				n.RPC(item.dst, item.msg, func(msg maelstrom.Message) error {
+					log.Printf("Sender %d: acknowledged %d from node %s", senderId, item.msg.Message, item.dst)
+					ackLock.Lock()
+					acks[item.mid] = struct{}{}
+					ackLock.Unlock()
+					return nil
+				})
+				work <- item
+			}
+		}()
 	}
-	svc.brLock.Unlock()
 }
 
 func main() {
 	n := maelstrom.NewNode()
 	svc := createBroadcastSvc()
 
-	type broadcastBody struct {
-		Type    string `json:"type"`
-		Message int    `json:"message"`
-	}
+	work := make(chan workItem, 100_000)
+	workers(n, 1, work)
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body broadcastBody
@@ -99,19 +117,24 @@ func main() {
 		}
 
 		if svc.add(body.Message) {
-			svc.startSend(body.Message)
-			unsent := svc.unsent()
-			for node, nodeMessages := range unsent {
-				for message := range nodeMessages {
-					func(nd string, m int) {
-						n.RPC(nd, broadcastBody{
-							Type:    "broadcast",
-							Message: message,
-						}, func(msg maelstrom.Message) error {
-							svc.commitSent(node, m)
-							return nil
-						})
-					}(node, message)
+			log.Printf("Received %d from node %s", body.Message, msg.Src)
+
+			neighbors := svc.neighbors()
+
+			for _, dst := range neighbors {
+				if dst == msg.Src {
+					continue
+				}
+
+				log.Printf("Scheduling message %d to %s", body.Message, dst)
+				select {
+				case work <- workItem{
+					mid: fmt.Sprintf("%s-%d", dst, body.Message),
+					dst: dst,
+					msg: body,
+				}:
+				default:
+					fmt.Println("Channel full. Discarding message")
 				}
 			}
 		}
@@ -140,7 +163,7 @@ func main() {
 			return err
 		}
 
-		svc.updateTopology(body.Topology[n.ID()])
+		svc.setNeighbors(body.Topology[msg.Dest])
 		res := make(map[string]any)
 		res["type"] = "topology_ok"
 
@@ -150,4 +173,5 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+	close(work)
 }
