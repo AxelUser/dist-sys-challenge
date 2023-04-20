@@ -109,7 +109,11 @@ func send(n *maelstrom.Node, receivers map[string]bool, body broadcastBody, dela
 
 }
 
-const RETRY_MILL = 2000
+const RETRY_MILL = 5000
+
+func getTopology(nodes []string) map[string][]string {
+	return topology.Tree(nodes, 5)
+}
 
 func main() {
 	n := maelstrom.NewNode()
@@ -161,7 +165,7 @@ func main() {
 			return err
 		}
 
-		neighbors := topology.Tree(n.NodeIDs(), 4)[n.ID()]
+		neighbors := getTopology(n.NodeIDs())[n.ID()]
 		log.Printf("Topology for %s: %v", n.ID(), neighbors)
 		svc.setNeighbors(neighbors)
 

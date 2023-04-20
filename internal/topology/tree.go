@@ -16,9 +16,6 @@ func bfs(nodes []string, children int, topology map[string][]string, idx int, pa
 }
 
 func Tree(nodes []string, children int) map[string][]string {
-	// take node i
-	// add next n to children
-	// for each children add next n as children
 	topology := make(map[string][]string)
 	for _, n := range nodes {
 		topology[n] = make([]string, 0)
