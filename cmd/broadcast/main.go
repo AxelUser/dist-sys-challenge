@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AxelUser/dist-sys-challenge/internal/topology"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
@@ -160,7 +161,10 @@ func main() {
 			return err
 		}
 
-		svc.setNeighbors(body.Topology[msg.Dest])
+		neighbors := topology.Tree(n.NodeIDs(), 4)[n.ID()]
+		log.Printf("Topology for %s: %v", n.ID(), neighbors)
+		svc.setNeighbors(neighbors)
+
 		res := make(map[string]any)
 		res["type"] = "topology_ok"
 
