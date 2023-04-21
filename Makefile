@@ -26,6 +26,10 @@ build_gcounter:
 	go build -o ./bin/maelstrom-gcounter ./cmd/g-counter/main.go
 	chmod +x ./bin/maelstrom-gcounter
 
+build_kafka:
+	go build -o ./bin/maelstrom-kafka ./cmd/kafka/main.go
+	chmod +x ./bin/maelstrom-kafka
+
 run_broadcast_singlenode:
 	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 1 --time-limit 20 --rate 10
 
@@ -40,6 +44,9 @@ run_broadcast_efficient:
 
 run_gcounter:
 	./third-party/maelstrom/maelstrom test -w g-counter --bin ./bin/maelstrom-gcounter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+
+run_kafka_single:
+	./third-party/maelstrom/maelstrom test -w kafka --bin ./bin/maelstrom-kafka --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
 
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve
