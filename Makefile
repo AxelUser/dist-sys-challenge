@@ -22,6 +22,10 @@ build_broadcast:
 	go build -o ./bin/maelstrom-broadcast ./cmd/broadcast/main.go
 	chmod +x ./bin/maelstrom-broadcast
 
+build_gcounter:
+	go build -o ./bin/maelstrom-gcounter ./cmd/g-counter/main.go
+	chmod +x ./bin/maelstrom-gcounter
+
 run_broadcast_singlenode:
 	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 1 --time-limit 20 --rate 10
 
@@ -33,6 +37,9 @@ run_broadcast_partition:
 
 run_broadcast_efficient:
 	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
+
+run_gcounter:
+	./third-party/maelstrom/maelstrom test -w g-counter --bin ./bin/maelstrom-gcounter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve
