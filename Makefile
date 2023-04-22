@@ -48,5 +48,8 @@ run_gcounter:
 run_kafka_single:
 	./third-party/maelstrom/maelstrom test -w kafka --bin ./bin/maelstrom-kafka --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
 
+run_kafka_multi:
+	./third-party/maelstrom/maelstrom test -w kafka --bin ./bin/maelstrom-kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve

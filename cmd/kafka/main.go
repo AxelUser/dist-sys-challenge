@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -45,79 +46,148 @@ type listCommittedOffsetsRes struct {
 }
 
 type kafkaSvc struct {
-	msgs        map[string][]int
-	msgsLock    sync.RWMutex
-	commits     map[string]int
-	commitsLock sync.RWMutex
+	n  *maelstrom.Node
+	kv *maelstrom.KV
 }
 
-func createKafka() *kafkaSvc {
+func createKafka(n *maelstrom.Node, kv *maelstrom.KV) *kafkaSvc {
 	return &kafkaSvc{
-		msgs:    map[string][]int{},
-		commits: map[string]int{},
+		n:  n,
+		kv: kv,
 	}
+}
+
+func lock(k *kafkaSvc, key string, wrapped func()) {
+	lockKey := fmt.Sprintf("%s-lock", key)
+	for {
+		if k.kv.CompareAndSwap(context.Background(), lockKey, nil, k.nodeID(), true) == nil {
+			log.Printf("Acquired lock on key %s for node %s", key, k.nodeID())
+			break
+		}
+	}
+
+	wrapped()
+
+	k.kv.Write(context.Background(), lockKey, nil)
+}
+
+func (k *kafkaSvc) nodeID() string {
+	return k.n.ID()
 }
 
 func (k *kafkaSvc) send(key string, msg int) int {
 	var offset int
 
-	k.msgsLock.Lock()
-	if msgs, ok := k.msgs[key]; !ok {
-		k.msgs[key] = []int{msg}
-		offset = 0
-	} else {
-		k.msgs[key] = append(msgs, msg)
-		offset = len(msgs)
-	}
-	k.msgsLock.Unlock()
+	lock(k, "log", func() {
 
+		stored, err := k.kv.Read(context.Background(), "log")
+
+		var parsed map[string][]int
+
+		if err != nil {
+			parsed = map[string][]int{}
+		} else {
+			json.Unmarshal([]byte(stored.(string)), &parsed)
+		}
+
+		if _, ok := parsed[key]; !ok {
+			// init key log
+			offset = 0
+			parsed[key] = []int{msg}
+		} else {
+			// append message to key log
+			offset = len(parsed[key])
+			parsed[key] = append(parsed[key], msg)
+		}
+
+		bytes, _ := json.Marshal(parsed)
+		k.kv.Write(context.Background(), "log", string(bytes))
+	})
+
+	log.Printf("Appended %d to key %s with offset %d", msg, key, offset)
 	return offset
 }
 
 func (k *kafkaSvc) poll(offsets map[string]int) map[string][][]int {
-	msgs := make(map[string][][]int)
+	var msgsWithOffsets map[string][][]int
 
-	k.msgsLock.RLock()
-	for key, offset := range offsets {
-		if m, ok := k.msgs[key]; !ok {
-			msgs[key] = [][]int{}
+	lock(k, "log", func() {
+		stored, err := k.kv.Read(context.Background(), "log")
+
+		var parsed map[string][]int
+
+		if err != nil {
+			parsed = map[string][]int{}
 		} else {
-			mo := [][]int{}
-			count := len(m)
-			for i := offset; i < count; i++ {
-				mo = append(mo, []int{i, m[i]})
-			}
-			msgs[key] = mo
+			json.Unmarshal([]byte(stored.(string)), &parsed)
 		}
-	}
-	k.msgsLock.RUnlock()
 
-	return msgs
+		msgsWithOffsets = make(map[string][][]int)
+
+		for key, offset := range offsets {
+			if m, ok := parsed[key]; !ok {
+				msgsWithOffsets[key] = [][]int{}
+			} else {
+				mo := [][]int{}
+				count := len(m)
+				for i := offset; i < count; i++ {
+					mo = append(mo, []int{i, m[i]})
+				}
+				msgsWithOffsets[key] = mo
+			}
+		}
+	})
+
+	return msgsWithOffsets
 }
 
 func (k *kafkaSvc) commit(offsets map[string]int) {
-	k.commitsLock.Lock()
-	for key, offset := range offsets {
-		k.commits[key] = offset
-	}
-	k.commitsLock.Unlock()
+	lock(k, "commits", func() {
+		stored, err := k.kv.Read(context.Background(), "commits")
+
+		var parsed map[string]int
+
+		if err != nil {
+			parsed = map[string]int{}
+		} else {
+			json.Unmarshal([]byte(stored.(string)), &parsed)
+		}
+
+		for key, offset := range offsets {
+			parsed[key] = offset
+		}
+
+		bytes, _ := json.Marshal(parsed)
+		k.kv.Write(context.Background(), "commits", string(bytes))
+	})
 }
 
 func (k *kafkaSvc) listCommitted(keys []string) map[string]int {
 	offsets := make(map[string]int)
 
-	k.commitsLock.RLock()
-	for _, key := range keys {
-		offsets[key] = k.commits[key]
-	}
-	k.commitsLock.RUnlock()
+	lock(k, "commits", func() {
+		stored, err := k.kv.Read(context.Background(), "commits")
+
+		var parsed map[string]int
+
+		if err != nil {
+			parsed = map[string]int{}
+		} else {
+			json.Unmarshal([]byte(stored.(string)), &parsed)
+		}
+
+		for key, offset := range parsed {
+			offsets[key] = offset
+		}
+	})
 
 	return offsets
 }
 
 func main() {
 	n := maelstrom.NewNode()
-	kafka := createKafka()
+	kv := maelstrom.NewLinKV(n)
+	kafka := createKafka(n, kv)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body sendReq
