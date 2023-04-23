@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
-	"sync"
+	"strconv"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -40,29 +41,34 @@ func toBody(txns []txn) [][]any {
 }
 
 type txnSvc struct {
-	storage     map[int]int
-	storageLock sync.Mutex
+	kv *maelstrom.KV
 }
 
-func createTxnSvc() *txnSvc {
+func createTxnSvc(kv *maelstrom.KV) *txnSvc {
 	return &txnSvc{
-		storage: make(map[int]int),
+		kv: kv,
 	}
 }
 
 func (t *txnSvc) apply(txns []txn) []txn {
-	t.storageLock.Lock()
+TX_START:
 	for i, txn := range txns {
 		switch txn.Op {
 		case "r":
-			if val, ok := t.storage[txn.Key]; ok {
+			val, err := t.kv.ReadInt(context.Background(), strconv.Itoa(txn.Key))
+			if err == nil {
 				txns[i].Value = &val
 			}
 		case "w":
-			t.storage[txn.Key] = *txn.Value
+			curVal, err := t.kv.ReadInt(context.Background(), strconv.Itoa(txn.Key))
+			// if err != nil, create key, else update
+			create := err != nil
+			if t.kv.CompareAndSwap(context.Background(), strconv.Itoa(txn.Key), curVal, *txn.Value, create) != nil {
+				// dirty write, retry
+				goto TX_START
+			}
 		}
 	}
-	t.storageLock.Unlock()
 	return txns
 }
 
@@ -72,7 +78,7 @@ type txnReq struct {
 
 func main() {
 	n := maelstrom.NewNode()
-	t := createTxnSvc()
+	t := createTxnSvc(maelstrom.NewLinKV(n))
 
 	n.Handle("txn", func(msg maelstrom.Message) error {
 		var req txnReq

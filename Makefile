@@ -58,5 +58,8 @@ run_kafka_multi:
 run_txn_single:
 	./third-party/maelstrom/maelstrom test -w txn-rw-register --bin ./bin/maelstrom-txn --node-count 1 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
 
+run_txn_read_uncommitted:
+	./third-party/maelstrom/maelstrom test -w txn-rw-register --bin ./bin/maelstrom-txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted --availability total --nemesis partition
+
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve
