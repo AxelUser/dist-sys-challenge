@@ -30,6 +30,10 @@ build_kafka:
 	go build -o ./bin/maelstrom-kafka ./cmd/kafka/main.go
 	chmod +x ./bin/maelstrom-kafka
 
+build_txn:
+	go build -o ./bin/maelstrom-txn ./cmd/txn/main.go
+	chmod +x ./bin/maelstrom-txn
+
 run_broadcast_singlenode:
 	./third-party/maelstrom/maelstrom test -w broadcast --bin ./bin/maelstrom-broadcast --node-count 1 --time-limit 20 --rate 10
 
@@ -50,6 +54,9 @@ run_kafka_single:
 
 run_kafka_multi:
 	./third-party/maelstrom/maelstrom test -w kafka --bin ./bin/maelstrom-kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
+run_txn_single:
+	./third-party/maelstrom/maelstrom test -w txn-rw-register --bin ./bin/maelstrom-txn --node-count 1 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
 
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve
