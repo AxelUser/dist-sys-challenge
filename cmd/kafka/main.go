@@ -1,10 +1,10 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
 	"log"
+	"strconv"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -46,148 +46,210 @@ type listCommittedOffsetsRes struct {
 }
 
 type kafkaSvc struct {
-	n  *maelstrom.Node
-	kv *maelstrom.KV
+	n           *maelstrom.Node
+	msgs        map[string][]int
+	msgsLock    sync.RWMutex
+	commits     map[string]int
+	commitsLock sync.RWMutex
 }
 
-func createKafka(n *maelstrom.Node, kv *maelstrom.KV) *kafkaSvc {
+func createKafka(n *maelstrom.Node) *kafkaSvc {
 	return &kafkaSvc{
-		n:  n,
-		kv: kv,
+		n:       n,
+		msgs:    make(map[string][]int),
+		commits: make(map[string]int),
 	}
 }
 
-func lock(k *kafkaSvc, key string, wrapped func()) {
-	lockKey := fmt.Sprintf("%s-lock", key)
-	for {
-		if k.kv.CompareAndSwap(context.Background(), lockKey, nil, k.nodeID(), true) == nil {
-			log.Printf("Acquired lock on key %s for node %s", key, k.nodeID())
-			break
-		}
-	}
-
-	wrapped()
-
-	k.kv.Write(context.Background(), lockKey, nil)
-}
-
-func (k *kafkaSvc) nodeID() string {
-	return k.n.ID()
+func (k *kafkaSvc) location(key string) string {
+	// assume all keys are integers for simplicity
+	hash, _ := strconv.Atoi(key)
+	nodes := k.n.NodeIDs()
+	return nodes[hash%len(nodes)]
 }
 
 func (k *kafkaSvc) send(key string, msg int) int {
 	var offset int
 
-	lock(k, "log", func() {
-
-		stored, err := k.kv.Read(context.Background(), "log")
-
-		var parsed map[string][]int
-
-		if err != nil {
-			parsed = map[string][]int{}
-		} else {
-			json.Unmarshal([]byte(stored.(string)), &parsed)
-		}
-
-		if _, ok := parsed[key]; !ok {
+	master := k.location(key)
+	if master == k.n.ID() {
+		// append to local state
+		k.msgsLock.Lock()
+		if msgs, ok := k.msgs[key]; !ok {
 			// init key log
 			offset = 0
-			parsed[key] = []int{msg}
+			k.msgs[key] = []int{msg}
 		} else {
 			// append message to key log
-			offset = len(parsed[key])
-			parsed[key] = append(parsed[key], msg)
+			offset = len(msgs)
+			k.msgs[key] = append(msgs, msg)
 		}
+		k.msgsLock.Unlock()
+		log.Printf("Appended %d to key %s with offset %d", msg, key, offset)
+	} else {
+		// send to other node
+		var wg sync.WaitGroup
+		wg.Add(1)
+		k.n.RPC(master, sendReq{
+			Type: "send",
+			Key:  key,
+			Msg:  msg,
+		}, func(msg maelstrom.Message) error {
+			var body sendRes
+			json.Unmarshal(msg.Body, &body)
+			offset = body.Offset
+			wg.Done()
+			return nil
+		})
+		wg.Wait()
+	}
 
-		bytes, _ := json.Marshal(parsed)
-		k.kv.Write(context.Background(), "log", string(bytes))
-	})
-
-	log.Printf("Appended %d to key %s with offset %d", msg, key, offset)
 	return offset
 }
 
 func (k *kafkaSvc) poll(offsets map[string]int) map[string][][]int {
-	var msgsWithOffsets map[string][][]int
+	msgsWithOffsets := make(map[string][][]int)
 
-	lock(k, "log", func() {
-		stored, err := k.kv.Read(context.Background(), "log")
-
-		var parsed map[string][]int
-
-		if err != nil {
-			parsed = map[string][]int{}
+	offsetPerLocation := make(map[string]map[string]int)
+	for key, offset := range offsets {
+		msgsWithOffsets[key] = make([][]int, 0)
+		location := k.location(key)
+		if _, ok := offsetPerLocation[location]; !ok {
+			offsetPerLocation[location] = map[string]int{key: offset}
 		} else {
-			json.Unmarshal([]byte(stored.(string)), &parsed)
+			offsetPerLocation[location][key] = offset
 		}
+	}
 
-		msgsWithOffsets = make(map[string][][]int)
+	var wg sync.WaitGroup
+	wg.Add(len(offsetPerLocation))
 
-		for key, offset := range offsets {
-			if m, ok := parsed[key]; !ok {
-				msgsWithOffsets[key] = [][]int{}
-			} else {
-				mo := [][]int{}
-				count := len(m)
-				for i := offset; i < count; i++ {
-					mo = append(mo, []int{i, m[i]})
+	for location, keyOffsets := range offsetPerLocation {
+		go func(location string, keyOffsets map[string]int) {
+			// search in local storage
+			if location == k.n.ID() {
+				k.msgsLock.RLock()
+				for key, offset := range keyOffsets {
+					if m, ok := k.msgs[key]; !ok {
+						msgsWithOffsets[key] = [][]int{}
+					} else {
+						mo := [][]int{}
+						count := len(m)
+						for i := offset; i < count; i++ {
+							mo = append(mo, []int{i, m[i]})
+						}
+						msgsWithOffsets[key] = mo
+					}
 				}
-				msgsWithOffsets[key] = mo
+				k.msgsLock.RUnlock()
+				wg.Done()
+			} else {
+				// search in other nodes
+				k.n.RPC(location, pollReq{Type: "poll", Offsets: keyOffsets}, func(msg maelstrom.Message) error {
+					var body pollRes
+					json.Unmarshal(msg.Body, &body)
+					for key, msgs := range body.Msgs {
+						msgsWithOffsets[key] = msgs
+					}
+					wg.Done()
+					return nil
+				})
 			}
-		}
-	})
+		}(location, keyOffsets)
+	}
+
+	wg.Wait()
 
 	return msgsWithOffsets
 }
 
 func (k *kafkaSvc) commit(offsets map[string]int) {
-	lock(k, "commits", func() {
-		stored, err := k.kv.Read(context.Background(), "commits")
-
-		var parsed map[string]int
-
-		if err != nil {
-			parsed = map[string]int{}
+	offsetPerLocation := make(map[string]map[string]int)
+	for key, offset := range offsets {
+		location := k.location(key)
+		if _, ok := offsetPerLocation[location]; !ok {
+			offsetPerLocation[location] = map[string]int{key: offset}
 		} else {
-			json.Unmarshal([]byte(stored.(string)), &parsed)
+			offsetPerLocation[location][key] = offset
 		}
+	}
 
-		for key, offset := range offsets {
-			parsed[key] = offset
-		}
+	var wg sync.WaitGroup
+	wg.Add(len(offsetPerLocation))
 
-		bytes, _ := json.Marshal(parsed)
-		k.kv.Write(context.Background(), "commits", string(bytes))
-	})
+	for location, offsetPerKey := range offsetPerLocation {
+		go func(location string, offsetPerKey map[string]int) {
+			if location == k.n.ID() {
+				// commit to local storage
+				k.commitsLock.Lock()
+				for key, offset := range offsetPerKey {
+					k.commits[key] = offset
+					log.Printf("Committed offset %d for key %s", offset, key)
+				}
+				k.commitsLock.Unlock()
+				wg.Done()
+			} else {
+				// commit to other node
+				k.n.RPC(location, commitOffsetsReq{Type: "commit_offsets", Offsets: offsetPerKey}, func(msg maelstrom.Message) error {
+					wg.Done()
+					return nil
+				})
+			}
+		}(location, offsetPerKey)
+	}
+
+	wg.Wait()
 }
 
 func (k *kafkaSvc) listCommitted(keys []string) map[string]int {
 	offsets := make(map[string]int)
-
-	lock(k, "commits", func() {
-		stored, err := k.kv.Read(context.Background(), "commits")
-
-		var parsed map[string]int
-
-		if err != nil {
-			parsed = map[string]int{}
+	keysPerLocation := make(map[string][]string)
+	for _, key := range keys {
+		offsets[key] = 0
+		location := k.location(key)
+		if lk, ok := keysPerLocation[location]; !ok {
+			keysPerLocation[location] = []string{key}
 		} else {
-			json.Unmarshal([]byte(stored.(string)), &parsed)
+			keysPerLocation[location] = append(lk, key)
 		}
+	}
 
-		for key, offset := range parsed {
-			offsets[key] = offset
-		}
-	})
+	var wg sync.WaitGroup
+	wg.Add(len(keysPerLocation))
+
+	for location, locationKeys := range keysPerLocation {
+		go func(location string, locationKeys []string) {
+			if location == k.n.ID() {
+				// get local storage
+				k.commitsLock.RLock()
+				for _, key := range locationKeys {
+					offsets[key] = k.commits[key]
+				}
+				k.commitsLock.RUnlock()
+				wg.Done()
+			} else {
+				// get from another node
+				k.n.RPC(location, listCommittedOffsetsReq{Type: "list_committed_offsets", Keys: locationKeys}, func(msg maelstrom.Message) error {
+					var body listCommittedOffsetsRes
+					json.Unmarshal(msg.Body, &body)
+					for key, offset := range body.Offsets {
+						offsets[key] = offset
+					}
+					wg.Done()
+					return nil
+				})
+			}
+		}(location, locationKeys)
+	}
+
+	wg.Wait()
 
 	return offsets
 }
 
 func main() {
 	n := maelstrom.NewNode()
-	kv := maelstrom.NewLinKV(n)
-	kafka := createKafka(n, kv)
+	kafka := createKafka(n)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body sendReq
