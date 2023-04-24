@@ -61,5 +61,8 @@ run_txn_single:
 run_txn_read_uncommitted:
 	./third-party/maelstrom/maelstrom test -w txn-rw-register --bin ./bin/maelstrom-txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted --availability total --nemesis partition
 
+run_txn_read_committed:
+	./third-party/maelstrom/maelstrom test -w txn-rw-register --bin ./bin/maelstrom-txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-committed --availability total –-nemesis partition
+
 maelstrom_serve:
 	./third-party/maelstrom/maelstrom serve

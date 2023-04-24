@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"strconv"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -41,44 +43,103 @@ func toBody(txns []txn) [][]any {
 }
 
 type txnSvc struct {
-	kv *maelstrom.KV
+	n    *maelstrom.Node
+	mu   sync.RWMutex
+	keys map[int]int
 }
 
-func createTxnSvc(kv *maelstrom.KV) *txnSvc {
+func createTxnSvc(n *maelstrom.Node) *txnSvc {
 	return &txnSvc{
-		kv: kv,
+		n:    n,
+		keys: make(map[int]int),
 	}
 }
 
-func (t *txnSvc) apply(txns []txn) []txn {
-TX_START:
-	for i, txn := range txns {
+func (t *txnSvc) runTxn(txns []txn) ([]txn, error) {
+	final := make(map[int]int)
+
+	for _, txn := range txns {
 		switch txn.Op {
 		case "r":
-			val, err := t.kv.ReadInt(context.Background(), strconv.Itoa(txn.Key))
-			if err == nil {
-				txns[i].Value = &val
+			t.mu.RLock()
+			if v, ok := t.keys[txn.Key]; ok {
+				txn.Value = &v
 			}
+			t.mu.RUnlock()
 		case "w":
-			curVal, err := t.kv.ReadInt(context.Background(), strconv.Itoa(txn.Key))
-			// if err != nil, create key, else update
-			create := err != nil
-			if t.kv.CompareAndSwap(context.Background(), strconv.Itoa(txn.Key), curVal, *txn.Value, create) != nil {
-				// dirty write, retry
-				goto TX_START
-			}
+			final[txn.Key] = *txn.Value
 		}
 	}
-	return txns
+
+	go func() {
+		body := applyReq{
+			Type:   "apply",
+			Values: final,
+		}
+		for _, dst := range t.n.NodeIDs() {
+			go func(dst string) {
+				err := t.sendApply(dst, body, 5)
+				if err != nil {
+					log.Println(err.Error())
+				}
+			}(dst)
+		}
+	}()
+
+	t.mu.Lock()
+	for k, v := range final {
+		t.keys[k] = v
+	}
+	t.mu.Unlock()
+
+	return txns, nil
+}
+
+func (t *txnSvc) sendApply(dst string, body applyReq, retry int) error {
+	for i := 0; i < retry; i++ {
+		err := t.applyWithTimeout(dst, body, time.Second)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	return fmt.Errorf("fail apply to %s: %v", dst, body.Values)
+}
+
+func (t *txnSvc) applyWithTimeout(dst string, body applyReq, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := t.n.SyncRPC(ctx, dst, body)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *txnSvc) apply(values map[int]int) {
+	t.mu.Lock()
+	for k, v := range values {
+		t.keys[k] = v
+	}
+	t.mu.Unlock()
 }
 
 type txnReq struct {
 	Txn [][]any `json:"txn"`
 }
 
+type applyReq struct {
+	Type   string      `json:"type"`
+	Values map[int]int `json:"values"`
+}
+
+const TX_TIMEOUT_MILLS = 2000
+
 func main() {
 	n := maelstrom.NewNode()
-	t := createTxnSvc(maelstrom.NewLinKV(n))
+	t := createTxnSvc(n)
 
 	n.Handle("txn", func(msg maelstrom.Message) error {
 		var req txnReq
@@ -87,11 +148,31 @@ func main() {
 		}
 
 		txns := readTxns(req.Txn)
-		txns = t.apply(txns)
+		txns, err := t.runTxn(txns)
+		if err != nil {
+			return n.Reply(msg, map[string]any{
+				"type": "error",
+				"code": maelstrom.TxnConflict,
+				"text": err.Error(),
+			})
+		}
 
 		return n.Reply(msg, map[string]any{
 			"type": "txn_ok",
 			"txn":  toBody(txns),
+		})
+	})
+
+	n.Handle("apply", func(msg maelstrom.Message) error {
+		var req applyReq
+		if err := json.Unmarshal(msg.Body, &req); err != nil {
+			return err
+		}
+
+		t.apply(req.Values)
+
+		return n.Reply(msg, map[string]string{
+			"type": "apply_ok",
 		})
 	})
 
